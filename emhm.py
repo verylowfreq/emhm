@@ -47,6 +47,7 @@ class App:
     DEFAULT_MASK_THRESHOLD = 0.1
     DEFAULT_MASK_EXPANSION = 0
     DEFUALT_MODEL_COMPLEXITY = 1  # 0, 1, or 2 (Full)
+    DEFAULT_BONE_WIDTH = 0.005
 
     MAXWIDTH_FOR_MP = 1024
     MAXHEIGHT_FOR_MP = 1024
@@ -70,7 +71,8 @@ class App:
         self.argparser.add_argument('-e', '--mask-expansion', type=int, default=App.DEFAULT_MASK_EXPANSION, help='How extent mask area (1...)')
         self.argparser.add_argument('-d', '--detection-threshold', type=float, default=App.DEFAULT_DETECTION_THRESHOLD, help='Threshold for detection in estimation')
         self.argparser.add_argument('-t', '--tracking-threshold', type=float, default=App.DEFAULT_TRACKING_THRESHOLD, help='Threshold for tracking in estimation')
-        self.argparser.add_argument('--draw-bones', action='store_true', help='For debug. Draw the bone lines detected')
+        self.argparser.add_argument('-b', '--draw-bones', action='store_true', help='For debug. Draw the bone lines detected')
+        self.argparser.add_argument('-w', '--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help='Width of bones in ratio to screen width (0.0-1.0)')
         self.argparser.add_argument('-c', '--model-complexity', choices='012', default=App.DEFUALT_MODEL_COMPLEXITY, help='ML model complexity(0, 1, or 2 (more accurate, heavy))')
         self.argparser.add_argument('-y', '--allow-overwrite', action='store_true', help='Overwrite the output file if exists')
         self.options = self.argparser.parse_args(args[1:])
@@ -145,6 +147,11 @@ class App:
                 dilate_kernel = None                
             maskthreshold = max(min(self.options.mask_threshold, 1), 0)
 
+            landmarkstyle = mp_drawing_styles.get_default_pose_landmarks_style()
+            for v in landmarkstyle.values():
+                v.circle_radius = math.floor(videoframesize[0] * self.options.bone_width / 2)
+            connectionsstyle = mp_drawing_styles.DrawingSpec(thickness=math.floor(videoframesize[0] * self.options.bone_width))
+
             # Init MediaPipe Pose estimation engine
             with mp_pose.Pose(
                 model_complexity=int(self.options.model_complexity),
@@ -200,7 +207,9 @@ class App:
                                     frame,
                                     results.pose_landmarks,
                                     mp_pose.POSE_CONNECTIONS,
-                                    landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
+                                    # landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
+                                    landmark_drawing_spec=landmarkstyle,
+                                    connection_drawing_spec=connectionsstyle
                                 )
 
                         frames_buffer.append(frame)
