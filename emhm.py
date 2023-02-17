@@ -25,7 +25,7 @@
 LICENSE_DESCRIPTION = "Licensed under MIT License (C) 2023 verylowfreq"
 
 
-from typing import List, NoReturn
+from typing import List, NoReturn, Optional
 from pprint import pprint
 import traceback
 import sys
@@ -33,6 +33,8 @@ import math
 import time
 import argparse
 import os
+import threading
+from queue import Queue
 import cv2
 import numpy as np
 
@@ -71,8 +73,8 @@ class App:
         self.argparser.add_argument('-e', '--mask-expansion', type=int, default=App.DEFAULT_MASK_EXPANSION, help='How extent mask area (1...)')
         self.argparser.add_argument('-d', '--detection-threshold', type=float, default=App.DEFAULT_DETECTION_THRESHOLD, help='Threshold for detection in estimation')
         self.argparser.add_argument('-t', '--tracking-threshold', type=float, default=App.DEFAULT_TRACKING_THRESHOLD, help='Threshold for tracking in estimation')
-        self.argparser.add_argument('-b', '--draw-bones', action='store_true', help='For debug. Draw the bone lines detected')
-        self.argparser.add_argument('-w', '--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help='Width of bones in ratio to screen width (0.0-1.0)')
+        self.argparser.add_argument('-b', '--draw-bones', action='store_true', help='For debug. Draw the detected bone lines')
+        self.argparser.add_argument('-w', '--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help=f'Width of bones in ratio to screen width (0.0-1.0; default {App.DEFAULT_BONE_WIDTH})')
         self.argparser.add_argument('-c', '--model-complexity', choices='012', default=App.DEFUALT_MODEL_COMPLEXITY, help='ML model complexity(0, 1, or 2 (more accurate, heavy))')
         self.argparser.add_argument('-y', '--allow-overwrite', action='store_true', help='Overwrite the output file if exists')
         self.options = self.argparser.parse_args(args[1:])
@@ -99,6 +101,23 @@ class App:
             start_with_light_gray = not start_with_light_gray
         return mat
 
+
+    def encoding_thread_main(self, queue:Queue, videowriter:cv2.VideoWriter) -> None:
+        try:
+            while True:
+                newitem:Optional[np.ndarray] = queue.get()
+                if newitem is None:
+                    # None is a mark for exit.
+                    break
+
+                # newitem is a new frame to be encoded
+                videowriter.write(newitem)
+
+            return
+
+        except:
+            traceback.print_exc()
+            return
 
 
     def main(self) -> NoReturn:
@@ -130,6 +149,10 @@ class App:
 
         exit_code = -8
 
+        self.queue = Queue(64)
+        self.encode_thread = threading.Thread(target=self.encoding_thread_main, args=(self.queue, writer))
+        self.encode_thread.start()
+
         print('Processing...')
 
         try:
@@ -137,7 +160,8 @@ class App:
             prev_status_update_time = time.time()
             start_time = time.time()
             processed_frames = 0
-            frame_block_size = videofps
+            # frame_block_size = videofps
+            frame_block_size = 8
             frames_buffer = []
             is_last_frame = False
             if self.options.mask_expansion >= 1:
@@ -151,6 +175,7 @@ class App:
             for v in landmarkstyle.values():
                 v.circle_radius = math.floor(videoframesize[0] * self.options.bone_width / 2)
             connectionsstyle = mp_drawing_styles.DrawingSpec(thickness=math.floor(videoframesize[0] * self.options.bone_width))
+
 
             # Init MediaPipe Pose estimation engine
             with mp_pose.Pose(
@@ -218,7 +243,8 @@ class App:
                         try:
                             while True:
                                 f = frames_buffer.pop(0)
-                                writer.write(f)
+                                # writer.write(f)
+                                self.queue.put(f)
                         except IndexError:
                             pass
 
@@ -261,6 +287,9 @@ class App:
             exit_code = -16
 
         finally:
+            self.queue.put(None)
+            self.encode_thread.join()
+
             cap.release()
             writer.release()
 
