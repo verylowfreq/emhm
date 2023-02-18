@@ -51,6 +51,7 @@ class App:
     DEFAULT_MASK_EXPANSION = 0
     DEFUALT_MODEL_COMPLEXITY = 1  # 0, 1, or 2 (Full)
     DEFAULT_BONE_WIDTH = 0.005
+    DEFAULT_BONE_COLOR = "white"
 
     MAXWIDTH_FOR_MP = 1024
     MAXHEIGHT_FOR_MP = 1024
@@ -74,8 +75,9 @@ class App:
         self.argparser.add_argument('-e', '--mask-expansion', type=int, default=App.DEFAULT_MASK_EXPANSION, help='How extent mask area (1...)')
         self.argparser.add_argument('-d', '--detection-threshold', type=float, default=App.DEFAULT_DETECTION_THRESHOLD, help='Threshold for detection in estimation')
         self.argparser.add_argument('-t', '--tracking-threshold', type=float, default=App.DEFAULT_TRACKING_THRESHOLD, help='Threshold for tracking in estimation')
-        self.argparser.add_argument('-b', '--draw-bones', action='store_true', help='For debug. Draw the detected bone lines')
-        self.argparser.add_argument('-w', '--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help=f'Width of bones in ratio to screen width (0.0-1.0; default {App.DEFAULT_BONE_WIDTH})')
+        self.argparser.add_argument('--draw-bones', action='store_true', help='For debug. Draw the detected bone lines')
+        self.argparser.add_argument('--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help=f'Width of bones in ratio to screen width (0.0-1.0; default {App.DEFAULT_BONE_WIDTH})')
+        self.argparser.add_argument('--bone-color', choices=['white','black','red','green','blue'], default=App.DEFAULT_BONE_COLOR, help=f'Bone color (white,black,red,green,blue ; default {App.DEFAULT_BONE_COLOR})')
         self.argparser.add_argument('-c', '--model-complexity', choices='012', default=App.DEFUALT_MODEL_COMPLEXITY, help='ML model complexity(0, 1, or 2 (more accurate, heavy))')
         self.argparser.add_argument('-y', '--allow-overwrite', action='store_true', help='Overwrite the output file if exists')
         self.argparser.add_argument('--use-inpaint-foots', action='store_true', help='Use inpainting algorithm for foots')
@@ -103,12 +105,13 @@ class App:
             start_with_light_gray = not start_with_light_gray
         return mat
 
+
     @staticmethod
-    def get_center_of_triangle(pos1, pos2, pos3) -> Tuple[float, float]:
-        x_sum = pos1.x + pos2.x + pos3.x
-        y_sum = pos1.y + pos2.y + pos3.y
-        x = x_sum / 3
-        y = y_sum / 3
+    def get_center_of_points(*points) -> Tuple[float, float]:
+        x_sum = sum([p.x for p in points])
+        y_sum = sum([p.y for p in points])
+        x = x_sum / len(points)
+        y = y_sum / len(points)
         return (x, y)
 
     @staticmethod
@@ -122,8 +125,8 @@ class App:
         ankle = landmarks[ankle]
         heel = landmarks[heel]
         footindex = landmarks[footindex]
-        center_pos = App.get_center_of_triangle(ankle, heel, footindex)
-        circle_radius = App.get_distance(heel, footindex)
+        center_pos = App.get_center_of_points(heel, footindex)
+        circle_radius = App.get_distance(heel, footindex) / 2
         center_pos = (math.floor(center_pos[0] * width), math.floor(center_pos[1] * height))
         circle_radius = math.floor(circle_radius * width)
         return (center_pos, circle_radius)
@@ -136,6 +139,7 @@ class App:
         Args:
           source: Target image (BGR color as uint8)
           segmentation_mask: mask of human (Grayscale as uint8)
+          landmarks: landmark list (results.pose_landmarks.landmark)
 
         Returns:
           Processed image as np.ndarray
@@ -185,19 +189,65 @@ class App:
 
         return source
 
-    def masking_thread_main(self, inqueue:Queue, outqueue:Queue) -> None:
-        """
-        Not implemented.
-        """
+
+    def postprocessing_thread_main(self, videoframesize:Tuple[int, int], inqueue:Queue, outqueue:Queue) -> None:
+
+        if self.options.mask_expansion >= 1:
+            kernel_size = math.floor(self.options.mask_expansion) + 1
+            dilate_kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        else:
+            dilate_kernel = None                
+        maskthreshold = max(min(self.options.mask_threshold, 1), 0)
+
+        landmarkstyle = mp_drawing_styles.get_default_pose_landmarks_style()
+        for v in landmarkstyle.values():
+            v.circle_radius = math.floor(videoframesize[0] * self.options.bone_width / 2)
+        # NOTE: Specify the color in BGR
+        colortable = { "white": (255,255,255), "black":"0,0,0", "red":(0,0,255), "green":(0,255,0), "blue":(255,0,0)}
+        connectionscolor = colortable[self.options.bone_color]
+        connectionsstyle = mp_drawing_styles.DrawingSpec(color=connectionscolor, thickness=math.floor(videoframesize[0] * self.options.bone_width))
+
         try:
             while True:
-                newitem:Optional[np.ndarray] = inqueue.get()
+                newitem:Optional[Tuple[np.ndarray, Any]] = inqueue.get()
                 if newitem is None:
                     break
                 
                 # Execute post processing
+                frame, results = newitem
 
-                frame = None
+                if results is not None:
+                    # Segmentation mask is 0-1.0
+                    mask = results.segmentation_mask
+                    # mask = np.where(mask <= maskthreshold, 255, 0).astype(np.uint8)
+                    mask = np.where(mask <= maskthreshold, 0, 255).astype(np.uint8)
+
+                    if dilate_kernel is not None:
+                        # Expand area
+                        mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+
+                    # mask2 = np.where(mask != 0, 0, 255).astype(np.uint8)
+                    mask2 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+                    # Update frame
+                    frame = np.where(mask2 != 0, self.prev_frame, frame)
+
+                    if self.options.use_inpaint_foots:
+                        self.inpaint_foots(frame, mask, results.pose_landmarks.landmark)
+
+                    # Copy as previous frame for next loop
+                    self.prev_frame[:,:,:] = frame
+
+                    # Draw bones on frame if requested.
+                    if self.options.draw_bones:
+                        mp_drawing.draw_landmarks(
+                            frame,
+                            results.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS,
+                            # landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
+                            landmark_drawing_spec=landmarkstyle,
+                            connection_drawing_spec=connectionsstyle
+                        )
 
                 # Pass to encoding thread
                 outqueue.put(frame)
@@ -254,8 +304,13 @@ class App:
 
         exit_code = -8
 
-        self.queue = Queue(64)
-        self.encode_thread = threading.Thread(target=self.encoding_thread_main, args=(self.queue, writer))
+        self.queue1 = Queue(64)
+        self.queue2 = Queue(64)
+
+        self.postprocess_thread = threading.Thread(target=self.postprocessing_thread_main, args=(videoframesize, self.queue1, self.queue2))
+        self.postprocess_thread.start()
+
+        self.encode_thread = threading.Thread(target=self.encoding_thread_main, args=(self.queue2, writer))
         self.encode_thread.start()
 
         print('Processing...')
@@ -265,21 +320,10 @@ class App:
             prev_status_update_time = time.time()
             start_time = time.time()
             processed_frames = 0
-            # frame_block_size = videofps
+            # Process 8 frames at a time with MediaPipe and pass to postprocessing ; value based on rough measurements.
             frame_block_size = 8
             frames_buffer = []
             is_last_frame = False
-            if self.options.mask_expansion >= 1:
-                kernel_size = math.floor(self.options.mask_expansion) + 1
-                dilate_kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            else:
-                dilate_kernel = None                
-            maskthreshold = max(min(self.options.mask_threshold, 1), 0)
-
-            landmarkstyle = mp_drawing_styles.get_default_pose_landmarks_style()
-            for v in landmarkstyle.values():
-                v.circle_radius = math.floor(videoframesize[0] * self.options.bone_width / 2)
-            connectionsstyle = mp_drawing_styles.DrawingSpec(thickness=math.floor(videoframesize[0] * self.options.bone_width))
 
 
             # Init MediaPipe Pose estimation engine
@@ -308,51 +352,19 @@ class App:
 
                         if not results or results.segmentation_mask is None or len(results.segmentation_mask) < 1:
                             # If estimation result is empty, write frame as original.
-                            pass
+                            frames_buffer.append((frame, None))
                         
                         else:
                             # On estimation succeeded
+                            frames_buffer.append((frame, results))
 
-                            # Segmentation mask is 0-1.0
-                            mask = results.segmentation_mask
-                            # mask = np.where(mask <= maskthreshold, 255, 0).astype(np.uint8)
-                            mask = np.where(mask <= maskthreshold, 0, 255).astype(np.uint8)
-
-                            if dilate_kernel is not None:
-                                # Expand area
-                                mask = cv2.dilate(mask, dilate_kernel, iterations=1)
-
-                            # mask2 = np.where(mask != 0, 0, 255).astype(np.uint8)
-                            mask2 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
-                            # Update frame
-                            frame = np.where(mask2 != 0, self.prev_frame, frame)
-
-                            if self.options.use_inpaint_foots:
-                                self.inpaint_foots(frame, mask, results.pose_landmarks.landmark)
-
-                            # Copy as previous frame for next loop
-                            self.prev_frame[:,:,:] = frame
-
-                            # Draw bones on frame if requested.
-                            if self.options.draw_bones:
-                                mp_drawing.draw_landmarks(
-                                    frame,
-                                    results.pose_landmarks,
-                                    mp_pose.POSE_CONNECTIONS,
-                                    # landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
-                                    landmark_drawing_spec=landmarkstyle,
-                                    connection_drawing_spec=connectionsstyle
-                                )
-
-                        frames_buffer.append(frame)
 
                     if is_last_frame or len(frames_buffer) == frame_block_size:
                         try:
                             while True:
                                 f = frames_buffer.pop(0)
                                 # writer.write(f)
-                                self.queue.put(f)
+                                self.queue1.put(f)
                         except IndexError:
                             pass
 
@@ -378,7 +390,7 @@ class App:
             try:
                 while True:
                     f = frames_buffer.pop(0)
-                    writer.write(f)
+                    self.queue1.put(f)
             except IndexError:
                 pass
             print('Interrupted by user.')
@@ -395,7 +407,10 @@ class App:
             exit_code = -16
 
         finally:
-            self.queue.put(None)
+            self.queue1.put(None)
+            self.postprocess_thread.join()
+
+            self.queue2.put(None)
             self.encode_thread.join()
 
             cap.release()
