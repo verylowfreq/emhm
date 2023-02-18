@@ -22,10 +22,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+PROGRAM_SHORT_DESCRIPTION = "emhm"
 LICENSE_DESCRIPTION = "Licensed under MIT License (C) 2023 verylowfreq"
 
 
-from typing import List, NoReturn, Optional
+from typing import List, NoReturn, Optional, Any, Tuple, Iterable
 from pprint import pprint
 import traceback
 import sys
@@ -58,7 +59,7 @@ class App:
         pass
 
     def __init__(self) -> None:
-        print(LICENSE_DESCRIPTION)
+        print(PROGRAM_SHORT_DESCRIPTION + " " + LICENSE_DESCRIPTION)
         self.parse_args(sys.argv)
 
 
@@ -77,6 +78,7 @@ class App:
         self.argparser.add_argument('-w', '--bone-width', type=float, default=App.DEFAULT_BONE_WIDTH, help=f'Width of bones in ratio to screen width (0.0-1.0; default {App.DEFAULT_BONE_WIDTH})')
         self.argparser.add_argument('-c', '--model-complexity', choices='012', default=App.DEFUALT_MODEL_COMPLEXITY, help='ML model complexity(0, 1, or 2 (more accurate, heavy))')
         self.argparser.add_argument('-y', '--allow-overwrite', action='store_true', help='Overwrite the output file if exists')
+        self.argparser.add_argument('--use-inpaint-foots', action='store_true', help='Use inpainting algorithm for foots')
         self.options = self.argparser.parse_args(args[1:])
 
 
@@ -100,6 +102,109 @@ class App:
                 draw_light_gray = not draw_light_gray
             start_with_light_gray = not start_with_light_gray
         return mat
+
+    @staticmethod
+    def get_center_of_triangle(pos1, pos2, pos3) -> Tuple[float, float]:
+        x_sum = pos1.x + pos2.x + pos3.x
+        y_sum = pos1.y + pos2.y + pos3.y
+        x = x_sum / 3
+        y = y_sum / 3
+        return (x, y)
+
+    @staticmethod
+    def get_distance(pos1, pos2) -> float:
+        x_distance = math.fabs(pos1.x - pos2.x)
+        y_distance = math.fabs(pos1.y - pos2.y)
+        return math.sqrt(x_distance ** 2 + y_distance ** 2)
+    
+    @staticmethod
+    def get_center_and_radious_for_foot(width:int, height:int, landmarks:Iterable, ankle, heel, footindex) -> Tuple[Tuple[int, int], int]:
+        ankle = landmarks[ankle]
+        heel = landmarks[heel]
+        footindex = landmarks[footindex]
+        center_pos = App.get_center_of_triangle(ankle, heel, footindex)
+        circle_radius = App.get_distance(heel, footindex)
+        center_pos = (math.floor(center_pos[0] * width), math.floor(center_pos[1] * height))
+        circle_radius = math.floor(circle_radius * width)
+        return (center_pos, circle_radius)
+
+
+    def inpaint_foots(self, source:np.ndarray, segmentation_mask:np.ndarray, landmarks:List[Any]) -> np.ndarray:
+        """
+        Apply inpainting to foots.
+
+        Args:
+          source: Target image (BGR color as uint8)
+          segmentation_mask: mask of human (Grayscale as uint8)
+
+        Returns:
+          Processed image as np.ndarray
+        """
+
+        height, width, _channel = source.shape
+
+        left_center_pos, left_circle_radius = self.get_center_and_radious_for_foot(width, height, landmarks,
+                                                                                   mp_pose.PoseLandmark.LEFT_ANKLE,mp_pose.PoseLandmark.LEFT_HEEL,mp_pose.PoseLandmark.LEFT_FOOT_INDEX)
+
+        right_center_pos, right_circle_radius = self.get_center_and_radious_for_foot(width, height, landmarks,
+                                                                                     mp_pose.PoseLandmark.RIGHT_ANKLE,mp_pose.PoseLandmark.RIGHT_HEEL,mp_pose.PoseLandmark.RIGHT_FOOT_INDEX)
+
+
+        foots_circled_mask = np.zeros((height, width), dtype=np.uint8)
+
+        cv2.circle(foots_circled_mask, center=left_center_pos, radius=left_circle_radius, color=255, thickness=-1)
+        cv2.circle(foots_circled_mask, center=right_center_pos, radius=right_circle_radius, color=255, thickness=-1)
+
+        mask = cv2.bitwise_and(segmentation_mask, foots_circled_mask)
+
+        inpaintradius = 4
+
+        left_roi_top = math.floor(max(0, left_center_pos[1] - left_circle_radius * 2.5))
+        left_roi_left = math.floor(max(0, left_center_pos[0] - left_circle_radius * 2.5))
+        left_roi_right = math.floor(min(width, left_center_pos[0] + left_circle_radius * 2.5))
+        left_roi_bottom = math.floor(min(height, left_center_pos[1] + left_circle_radius * 2.5))
+
+        left_roi_image = source[left_roi_top:left_roi_bottom, left_roi_left:left_roi_right]
+        left_roi_mask = mask[left_roi_top:left_roi_bottom, left_roi_left:left_roi_right]
+
+        if np.any(left_roi_mask):
+            left_inpainted = cv2.inpaint(left_roi_image, left_roi_mask, inpaintradius, cv2.INPAINT_TELEA)
+            source[left_roi_top:left_roi_bottom, left_roi_left:left_roi_right] = left_inpainted
+
+        right_roi_top = math.floor(max(0, right_center_pos[1] - right_circle_radius * 2.5))
+        right_roi_left = math.floor(max(0, right_center_pos[0] - right_circle_radius * 2.5))
+        right_roi_right = math.floor(min(width, right_center_pos[0] + right_circle_radius * 2.5))
+        right_roi_bottom = math.floor(min(height, right_center_pos[1] + right_circle_radius * 2.5))
+
+        right_roi_image = source[right_roi_top:right_roi_bottom, right_roi_left:right_roi_right]
+        right_roi_mask = mask[right_roi_top:right_roi_bottom, right_roi_left:right_roi_right]
+
+        if np.any(right_roi_mask):
+            right_inpainted = cv2.inpaint(right_roi_image, right_roi_mask, inpaintradius, cv2.INPAINT_TELEA)
+            source[right_roi_top:right_roi_bottom, right_roi_left:right_roi_right] = right_inpainted
+
+        return source
+
+    def masking_thread_main(self, inqueue:Queue, outqueue:Queue) -> None:
+        """
+        Not implemented.
+        """
+        try:
+            while True:
+                newitem:Optional[np.ndarray] = inqueue.get()
+                if newitem is None:
+                    break
+                
+                # Execute post processing
+
+                frame = None
+
+                # Pass to encoding thread
+                outqueue.put(frame)
+
+        except:
+            traceback.print_exc()
+            return
 
 
     def encoding_thread_main(self, queue:Queue, videowriter:cv2.VideoWriter) -> None:
@@ -222,6 +327,9 @@ class App:
 
                             # Update frame
                             frame = np.where(mask2 != 0, self.prev_frame, frame)
+
+                            if self.options.use_inpaint_foots:
+                                self.inpaint_foots(frame, mask, results.pose_landmarks.landmark)
 
                             # Copy as previous frame for next loop
                             self.prev_frame[:,:,:] = frame
